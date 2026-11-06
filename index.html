@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>futex stress</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#000;color:#fff;
+    font:16px/1.25 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+  #app{height:600px;width:600px;box-sizing:border-box;padding:22px 24px;display:flex;flex-direction:column;gap:10px}
+  h1{font-size:20px;font-weight:600;margin:0;letter-spacing:.02em;color:#cfd8ff}
+  .row{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid #1b2233;padding:6px 0}
+  .k{color:#8e9bb3;font-size:15px}
+  .v{font-variant-numeric:tabular-nums;font-size:22px;font-weight:600;color:#fff}
+  .v.small{font-size:16px;font-weight:500}
+  .bad{color:#ff9b9b}
+  .ok{color:#9bffb0}
+  #foot{margin-top:auto;font-size:14px;color:#6f7c93}
+  #err{color:#ffb3b3;font-size:14px;margin-top:6px}
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>futex / thread-churn stress</h1>
+  <div class="row"><span class="k">session</span><span class="v" id="session">–</span></div>
+  <div class="row"><span class="k">uptime</span><span class="v" id="uptime">–</span></div>
+  <div class="row"><span class="k">workers spawned</span><span class="v" id="spawn">0</span></div>
+  <div class="row"><span class="k">futex waits</span><span class="v" id="waits">0</span></div>
+  <div class="row"><span class="k">previous runs</span><span class="v" id="runs">0</span></div>
+  <div class="row"><span class="k">last session</span><span class="v small" id="last">–</span></div>
+  <div class="row"><span class="k">isolation / SAB</span><span class="v small" id="sab">–</span></div>
+  <div id="err"></div>
+  <div id="foot">runs until it stops. if the glasses reboot, "previous runs" goes up.</div>
+</div>
+
+<script>
+// ---- cross-origin isolation bootstrap (needed for SharedArrayBuffer on GitHub Pages)
+(function () {
+  const KEY = 'coi_tried';
+  if (window.crossOriginIsolated) return;
+  if (!window.isSecureContext || !navigator.serviceWorker) return;
+  if (sessionStorage.getItem(KEY)) return;
+  sessionStorage.setItem(KEY, '1');
+  navigator.serviceWorker.register('sw.js').then(() => {
+    if (!navigator.serviceWorker.controller) location.reload();
+  }).catch(() => {});
+})();
+
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => n.toLocaleString('en-US');
+
+// ---- session accounting: a reboot kills the page, which increments this counter next time
+let runs = 0, last = 'none';
+try {
+  const st = JSON.parse(localStorage.getItem('futex_stress') || '{}');
+  runs = (st.runs || 0) + 1;
+  last = st.startedAt ? (Date.now() - st.startedAt) : 'none';
+  localStorage.setItem('futex_stress', JSON.stringify({ runs, startedAt: Date.now() }));
+} catch (e) {}
+$('session').textContent = '#' + runs;
+$('runs').textContent = fmt(runs - 1);
+$('last').textContent = last === 'none' ? 'first run' : (Math.round(last / 1000) + ' s before restart');
+
+// ---- capability report
+const hasSAB = typeof SharedArrayBuffer !== 'undefined';
+$('sab').innerHTML = (window.crossOriginIsolated ? '<span class="ok">isolated</span>' : '<span class="bad">not isolated</span>')
+  + ' / ' + (hasSAB ? '<span class="ok">SAB</span>' : '<span class="bad">no SAB</span>');
+if (!hasSAB) {
+  $('err').textContent = 'SharedArrayBuffer missing: Atomics.wait is unusable, futex stress disabled.';
+}
+
+// ---- the stress itself
+const WORKERS = 6;                 // threads churning through futex + teardown
+const CHURN_MS = 120;              // how often a worker is killed and replaced
+const WAIT_MS = 60;                // futex wait timeout per iteration
+const ALLOC_MB = 2;                // memory churn per worker cycle
+
+let spawned = 0, waits = 0;
+const t0 = performance.now();
+
+function workerSource() {
+  return `
+    let i32 = null;
+    onmessage = (e) => {
+      if (e.data.type === 'go') {
+        i32 = new Int32Array(e.data.sab);
+        for (;;) {
+          // Atomics.wait == futex(FUTEX_WAIT). With a timeout it returns "timed-out";
+          // the main thread also notifies, so both paths are exercised.
+          const r = Atomics.wait(i32, 0, 0, ${WAIT_MS});
+          Atomics.store(i32, 0, 0);
+          postMessage({ type: 'tick', r });
+          if (e.data.churn) { const buf = new ArrayBuffer(${ALLOC_MB} * 1024 * 1024); new Uint8Array(buf)[0] = 1; }
+        }
+      }
+    };
+  `;
+}
+
+const blobUrl = URL.createObjectURL(new Blob([workerSource()], { type: 'text/javascript' }));
+const shared = hasSAB ? new SharedArrayBuffer(16) : null;
+const i32 = shared ? new Int32Array(shared) : null;
+let live = [];
+
+function spawnOne() {
+  if (!shared) return;
+  let w;
+  try { w = new Worker(blobUrl); } catch (e) { $('err').textContent = 'worker failed: ' + e.message; return; }
+  w.onmessage = () => { waits++; };
+  w.postMessage({ type: 'go', sab: shared, churn: true });
+  live.push(w);
+  spawned++;
+}
+
+function churn() {
+  // kill one, add one: thread teardown + mm reuse, the shape of the futex races
+  const w = live.shift();
+  if (w) { try { w.terminate(); } catch (e) {} }
+  spawnOne();
+  if (i32) { Atomics.store(i32, 0, 1); Atomics.notify(i32, 0, 1); }
+}
+
+for (let i = 0; i < WORKERS; i++) spawnOne();
+const timer = setInterval(churn, CHURN_MS);
+
+setInterval(() => {
+  const up = Math.floor((performance.now() - t0) / 1000);
+  $('uptime').textContent = Math.floor(up / 60) + 'm ' + String(up % 60).padStart(2, '0') + 's';
+  $('spawn').textContent = fmt(spawned);
+  $('waits').textContent = fmt(waits);
+  try { localStorage.setItem('futex_stress', JSON.stringify({ runs, startedAt: Date.now() })); } catch (e) {}
+}, 1000);
+</script>
+</body>
+</html>
