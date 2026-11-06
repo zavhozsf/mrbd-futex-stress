@@ -5,23 +5,22 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>futex stress</title>
 <style>
-  html,body{margin:0;padding:0;height:100%;background:#000;color:#fff;
-    font:16px/1.25 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
-  #app{height:600px;width:600px;box-sizing:border-box;padding:22px 24px;display:flex;flex-direction:column;gap:10px}
-  h1{font-size:20px;font-weight:600;margin:0;letter-spacing:.02em;color:#cfd8ff}
-  .row{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid #1b2233;padding:6px 0}
-  .k{color:#8e9bb3;font-size:15px}
-  .v{font-variant-numeric:tabular-nums;font-size:22px;font-weight:600;color:#fff}
-  .v.small{font-size:16px;font-weight:500}
-  .bad{color:#ff9b9b}
-  .ok{color:#9bffb0}
-  #foot{margin-top:auto;font-size:14px;color:#6f7c93}
-  #err{color:#ffb3b3;font-size:14px;margin-top:6px}
+  html,body{margin:0;padding:0;min-height:100%;background:#000;color:#fff;
+    font:15px/1.25 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+  #app{width:600px;box-sizing:border-box;padding:18px 22px;display:flex;flex-direction:column;gap:6px}
+  h1{font-size:19px;font-weight:600;margin:0 0 4px;color:#cfd8ff}
+  .row{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid #1b2233;padding:5px 0;gap:12px}
+  .k{color:#8e9bb3;font-size:14px;white-space:nowrap}
+  .v{font-variant-numeric:tabular-nums;font-size:20px;font-weight:600;text-align:right}
+  .v.small{font-size:13px;font-weight:500;word-break:break-all}
+  .bad{color:#ff9b9b}.ok{color:#9bffb0}.warn{color:#ffd08a}
+  #diag{margin-top:8px;font-size:12px;color:#6f7c93;white-space:pre-wrap;word-break:break-all}
 </style>
 </head>
 <body>
 <div id="app">
   <h1>futex / thread-churn stress</h1>
+  <div class="row"><span class="k">mode</span><span class="v small" id="mode">–</span></div>
   <div class="row"><span class="k">session</span><span class="v" id="session">–</span></div>
   <div class="row"><span class="k">uptime</span><span class="v" id="uptime">–</span></div>
   <div class="row"><span class="k">workers spawned</span><span class="v" id="spawn">0</span></div>
@@ -29,106 +28,116 @@
   <div class="row"><span class="k">previous runs</span><span class="v" id="runs">0</span></div>
   <div class="row"><span class="k">last session</span><span class="v small" id="last">–</span></div>
   <div class="row"><span class="k">isolation / SAB</span><span class="v small" id="sab">–</span></div>
-  <div id="err"></div>
-  <div id="foot">runs until it stops. if the glasses reboot, "previous runs" goes up.</div>
+  <div class="row"><span class="k">service worker</span><span class="v small" id="sw">–</span></div>
+  <div id="diag"></div>
 </div>
 
 <script>
-// ---- cross-origin isolation bootstrap (needed for SharedArrayBuffer on GitHub Pages)
+// ---------- cross-origin isolation bootstrap ----------
+// GitHub Pages cannot send COOP/COEP; a service worker injects them. Two attempts max, then stop and
+// report why, instead of looping on a device that refuses service workers.
 (function () {
-  const KEY = 'coi_tried';
-  if (window.crossOriginIsolated) return;
-  if (!window.isSecureContext || !navigator.serviceWorker) return;
-  if (sessionStorage.getItem(KEY)) return;
-  sessionStorage.setItem(KEY, '1');
-  navigator.serviceWorker.register('sw.js').then(() => {
-    if (!navigator.serviceWorker.controller) location.reload();
-  }).catch(() => {});
+  window.__coiErr = '';
+  if (window.crossOriginIsolated) { try { sessionStorage.removeItem('coi_tries'); } catch (e) {} return; }
+  if (!window.isSecureContext) { window.__coiErr = 'not a secure context'; return; }
+  if (!('serviceWorker' in navigator)) { window.__coiErr = 'no serviceWorker in this browser'; return; }
+  var tries = 0;
+  try { tries = +(sessionStorage.getItem('coi_tries') || 0); } catch (e) {}
+  if (tries >= 2) { window.__coiErr = 'gave up after 2 reloads'; return; }
+  try { sessionStorage.setItem('coi_tries', String(tries + 1)); } catch (e) {}
+  navigator.serviceWorker.register('sw.js', { scope: './' })
+    .then(function () {
+      var go = function () { setTimeout(function () { location.reload(); }, 300); };
+      if (navigator.serviceWorker.controller) return go();
+      navigator.serviceWorker.ready.then(go).catch(go);
+    })
+    .catch(function (e) { window.__coiErr = 'SW register failed: ' + ((e && e.message) || e); });
 })();
 
-const $ = (id) => document.getElementById(id);
-const fmt = (n) => n.toLocaleString('en-US');
+var $ = function (id) { return document.getElementById(id); };
+var fmt = function (n) { return n.toLocaleString('en-US'); };
 
-// ---- session accounting: a reboot kills the page, which increments this counter next time
-let runs = 0, last = 'none';
+// ---------- session accounting ----------
+var runs = 0, last = 'none';
 try {
-  const st = JSON.parse(localStorage.getItem('futex_stress') || '{}');
+  var st = JSON.parse(localStorage.getItem('futex_stress') || '{}');
   runs = (st.runs || 0) + 1;
-  last = st.startedAt ? (Date.now() - st.startedAt) : 'none';
-  localStorage.setItem('futex_stress', JSON.stringify({ runs, startedAt: Date.now() }));
+  last = st.startedAt ? Math.round((Date.now() - st.startedAt) / 1000) : 'none';
+  localStorage.setItem('futex_stress', JSON.stringify({ runs: runs, startedAt: Date.now() }));
 } catch (e) {}
 $('session').textContent = '#' + runs;
-$('runs').textContent = fmt(runs - 1);
-$('last').textContent = last === 'none' ? 'first run' : (Math.round(last / 1000) + ' s before restart');
+$('runs').textContent = fmt(Math.max(runs - 1, 0));
+$('last').textContent = last === 'none' ? 'first run' : last + ' s before restart';
 
-// ---- capability report
-const hasSAB = typeof SharedArrayBuffer !== 'undefined';
+// ---------- capability report ----------
+var hasSAB = typeof SharedArrayBuffer !== 'undefined';
 $('sab').innerHTML = (window.crossOriginIsolated ? '<span class="ok">isolated</span>' : '<span class="bad">not isolated</span>')
-  + ' / ' + (hasSAB ? '<span class="ok">SAB</span>' : '<span class="bad">no SAB</span>');
-if (!hasSAB) {
-  $('err').textContent = 'SharedArrayBuffer missing: Atomics.wait is unusable, futex stress disabled.';
+  + ' / ' + (hasSAB ? '<span class="ok">SAB ok</span>' : '<span class="bad">no SAB</span>');
+$('mode').innerHTML = hasSAB ? '<span class="ok">futex + churn</span>' : '<span class="warn">churn only</span>';
+
+function diag() {
+  $('diag').textContent = [window.__coiErr, 'ua: ' + navigator.userAgent, 'origin: ' + location.origin]
+    .filter(Boolean).join('\n');
 }
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistration().then(function (r) {
+    $('sw').textContent = r ? (navigator.serviceWorker.controller ? 'controlling' : 'registered') : 'none';
+    diag();
+  }).catch(diag);
+} else { $('sw').textContent = 'unavailable'; diag(); }
 
-// ---- the stress itself
-const WORKERS = 6;                 // threads churning through futex + teardown
-const CHURN_MS = 120;              // how often a worker is killed and replaced
-const WAIT_MS = 60;                // futex wait timeout per iteration
-const ALLOC_MB = 2;                // memory churn per worker cycle
-
-let spawned = 0, waits = 0;
-const t0 = performance.now();
+// ---------- stress ----------
+var WORKERS = 6, CHURN_MS = 120, WAIT_MS = 60, ALLOC_MB = 2;
+var spawned = 0, waits = 0;
+var t0 = performance.now();
 
 function workerSource() {
-  return `
-    let i32 = null;
-    onmessage = (e) => {
-      if (e.data.type === 'go') {
-        i32 = new Int32Array(e.data.sab);
-        for (;;) {
-          // Atomics.wait == futex(FUTEX_WAIT). With a timeout it returns "timed-out";
-          // the main thread also notifies, so both paths are exercised.
-          const r = Atomics.wait(i32, 0, 0, ${WAIT_MS});
-          Atomics.store(i32, 0, 0);
-          postMessage({ type: 'tick', r });
-          if (e.data.churn) { const buf = new ArrayBuffer(${ALLOC_MB} * 1024 * 1024); new Uint8Array(buf)[0] = 1; }
-        }
-      }
-    };
-  `;
+  return 'onmessage = function (e) {' +
+    'var i32 = e.data.sab ? new Int32Array(e.data.sab) : null;' +
+    'for (;;) {' +
+    '  if (i32) {' +
+    '    var r = Atomics.wait(i32, 0, 0, ' + WAIT_MS + ');' +   // futex(FUTEX_WAIT)
+    '    Atomics.store(i32, 0, 0);' +
+    '    postMessage({ type: "tick", r: r });' +
+    '  } else {' +
+    '    var x = 0; for (var i = 0; i < 20000; i++) x += i;' +
+    '    postMessage({ type: "tick", r: "spin" });' +
+    '  }' +
+    '  var buf = new ArrayBuffer(' + ALLOC_MB + ' * 1024 * 1024); new Uint8Array(buf)[0] = 1;' +
+    '}' +
+  '};';
 }
 
-const blobUrl = URL.createObjectURL(new Blob([workerSource()], { type: 'text/javascript' }));
-const shared = hasSAB ? new SharedArrayBuffer(16) : null;
-const i32 = shared ? new Int32Array(shared) : null;
-let live = [];
+var blobUrl = URL.createObjectURL(new Blob([workerSource()], { type: 'text/javascript' }));
+var sab = hasSAB ? new SharedArrayBuffer(16) : null;
+var i32 = sab ? new Int32Array(sab) : null;
+var live = [];
 
 function spawnOne() {
-  if (!shared) return;
-  let w;
-  try { w = new Worker(blobUrl); } catch (e) { $('err').textContent = 'worker failed: ' + e.message; return; }
-  w.onmessage = () => { waits++; };
-  w.postMessage({ type: 'go', sab: shared, churn: true });
+  var w;
+  try { w = new Worker(blobUrl); } catch (e) { return; }
+  w.onmessage = function () { waits++; };
+  w.postMessage({ sab: sab });
   live.push(w);
   spawned++;
 }
 
 function churn() {
-  // kill one, add one: thread teardown + mm reuse, the shape of the futex races
-  const w = live.shift();
+  var w = live.shift();
   if (w) { try { w.terminate(); } catch (e) {} }
   spawnOne();
   if (i32) { Atomics.store(i32, 0, 1); Atomics.notify(i32, 0, 1); }
 }
 
-for (let i = 0; i < WORKERS; i++) spawnOne();
-const timer = setInterval(churn, CHURN_MS);
+for (var i = 0; i < WORKERS; i++) spawnOne();
+setInterval(churn, CHURN_MS);
 
-setInterval(() => {
-  const up = Math.floor((performance.now() - t0) / 1000);
+setInterval(function () {
+  var up = Math.floor((performance.now() - t0) / 1000);
   $('uptime').textContent = Math.floor(up / 60) + 'm ' + String(up % 60).padStart(2, '0') + 's';
   $('spawn').textContent = fmt(spawned);
   $('waits').textContent = fmt(waits);
-  try { localStorage.setItem('futex_stress', JSON.stringify({ runs, startedAt: Date.now() })); } catch (e) {}
+  try { localStorage.setItem('futex_stress', JSON.stringify({ runs: runs, startedAt: Date.now() })); } catch (e) {}
 }, 1000);
 </script>
 </body>
