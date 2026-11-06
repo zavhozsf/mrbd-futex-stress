@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>futex stress</title>
+<title>futex / churn stress</title>
 <style>
   html,body{margin:0;padding:0;min-height:100%;background:#000;color:#fff;
     font:15px/1.25 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
@@ -19,12 +19,12 @@
 </head>
 <body>
 <div id="app">
-  <h1>futex / thread-churn stress</h1>
+  <h1>futex / churn stress</h1>
   <div class="row"><span class="k">mode</span><span class="v small" id="mode">–</span></div>
   <div class="row"><span class="k">session</span><span class="v" id="session">–</span></div>
   <div class="row"><span class="k">uptime</span><span class="v" id="uptime">–</span></div>
-  <div class="row"><span class="k">workers spawned</span><span class="v" id="spawn">0</span></div>
-  <div class="row"><span class="k">futex waits</span><span class="v" id="waits">0</span></div>
+  <div class="row"><span class="k">threads churned</span><span class="v" id="spawn">0</span></div>
+  <div class="row"><span class="k">wait/spin events</span><span class="v" id="waits">0</span></div>
   <div class="row"><span class="k">previous runs</span><span class="v" id="runs">0</span></div>
   <div class="row"><span class="k">last session</span><span class="v small" id="last">–</span></div>
   <div class="row"><span class="k">isolation / SAB</span><span class="v small" id="sab">–</span></div>
@@ -33,9 +33,7 @@
 </div>
 
 <script>
-// ---------- cross-origin isolation bootstrap ----------
-// GitHub Pages cannot send COOP/COEP; a service worker injects them. Two attempts max, then stop and
-// report why, instead of looping on a device that refuses service workers.
+// ---------- cross-origin isolation bootstrap (needed only for SharedArrayBuffer) ----------
 (function () {
   window.__coiErr = '';
   if (window.crossOriginIsolated) { try { sessionStorage.removeItem('coi_tries'); } catch (e) {} return; }
@@ -69,11 +67,20 @@ $('session').textContent = '#' + runs;
 $('runs').textContent = fmt(Math.max(runs - 1, 0));
 $('last').textContent = last === 'none' ? 'first run' : last + ' s before restart';
 
-// ---------- capability report ----------
+// ---------- capabilities ----------
 var hasSAB = typeof SharedArrayBuffer !== 'undefined';
 $('sab').innerHTML = (window.crossOriginIsolated ? '<span class="ok">isolated</span>' : '<span class="bad">not isolated</span>')
   + ' / ' + (hasSAB ? '<span class="ok">SAB ok</span>' : '<span class="bad">no SAB</span>');
-$('mode').innerHTML = hasSAB ? '<span class="ok">futex + churn</span>' : '<span class="warn">churn only</span>';
+
+// Without SAB there is no Atomics.wait (no direct futex), so we go after thread teardown,
+// mmap/munmap churn and slab churn instead - the shape of CVE-2026-74658 / -99169 / -98507.
+var HAS_FUTEX = hasSAB;
+var WORKERS   = HAS_FUTEX ? 6 : 8;
+var CHURN_MS  = HAS_FUTEX ? 120 : 60;
+var WAIT_MS   = 60;
+$('mode').innerHTML = HAS_FUTEX
+  ? '<span class="ok">futex + churn</span>'
+  : '<span class="warn">churn only</span> (no SAB)';
 
 function diag() {
   $('diag').textContent = [window.__coiErr, 'ua: ' + navigator.userAgent, 'origin: ' + location.origin]
@@ -87,23 +94,26 @@ if ('serviceWorker' in navigator) {
 } else { $('sw').textContent = 'unavailable'; diag(); }
 
 // ---------- stress ----------
-var WORKERS = 6, CHURN_MS = 120, WAIT_MS = 60, ALLOC_MB = 2;
 var spawned = 0, waits = 0;
 var t0 = performance.now();
 
 function workerSource() {
   return 'onmessage = function (e) {' +
     'var i32 = e.data.sab ? new Int32Array(e.data.sab) : null;' +
+    'var small = [];' +
     'for (;;) {' +
     '  if (i32) {' +
     '    var r = Atomics.wait(i32, 0, 0, ' + WAIT_MS + ');' +   // futex(FUTEX_WAIT)
     '    Atomics.store(i32, 0, 0);' +
-    '    postMessage({ type: "tick", r: r });' +
+    '    postMessage({ r: r });' +
     '  } else {' +
-    '    var x = 0; for (var i = 0; i < 20000; i++) x += i;' +
-    '    postMessage({ type: "tick", r: "spin" });' +
+    '    var x = 0; for (var i = 0; i < 30000; i++) x += i;' +
+    '    postMessage({ r: "spin" });' +
     '  }' +
-    '  var buf = new ArrayBuffer(' + ALLOC_MB + ' * 1024 * 1024); new Uint8Array(buf)[0] = 1;' +
+    // mm churn: a mid-size mapping every cycle, plus a burst of small objects for the slab
+    '  var big = new ArrayBuffer(2 * 1024 * 1024); new Uint8Array(big)[0] = 1;' +
+    '  small.length = 0;' +
+    '  for (var j = 0; j < 64; j++) small.push(new ArrayBuffer(1024));' +
     '}' +
   '};';
 }
